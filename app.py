@@ -1,4 +1,10 @@
+import json
+import os
+import re
+import textwrap
+import time
 
+import streamlit as st
 from google import genai
 from google.genai import types
 
@@ -7,14 +13,11 @@ SUPPORTED_LANGUAGES = ["English", "Urdu", "Roman Urdu"]
 MIN_DURATION_WEEKS, MAX_DURATION_WEEKS = 2, 52
 MIN_DAILY_MINUTES, MAX_DAILY_MINUTES = 30, 480
 
-print("Configuration loaded successfully.")
-
 # ------------------------------------------------------------
 # STEP 2: Load and clean secrets
 # ------------------------------------------------------------
-# IMPORTANT:
-# Secret NAMES must be exactly: GEMINI_API_KEY and GROK_AUTH_TOKEN
-# NEVER put the actual key values directly in this code.
+# Streamlit Cloud secret name: GEMINI_API_KEY
+# NEVER put the actual key value directly in this code.
 # ------------------------------------------------------------
 
 def clean_key(raw_key: str) -> str:
@@ -28,10 +31,11 @@ GEMINI_SECRET_NAME = "GEMINI_API_KEY"
 
 
 def load_gemini_key():
-    """Load the Gemini key from Streamlit secrets or environment variables."""
+    """Load the Gemini key from Streamlit Cloud secrets or environment variables."""
     try:
-        if GEMINI_SECRET_NAME in st.secrets:
-            return clean_key(st.secrets[GEMINI_SECRET_NAME])
+        key = st.secrets.get(GEMINI_SECRET_NAME, "")
+        if key:
+            return clean_key(str(key))
     except Exception:
         pass
 
@@ -74,11 +78,15 @@ if API_KEY:
     try:
         client = genai.Client(api_key=API_KEY)
         model = GeminiModelWrapper(client, GEMINI_MODEL_NAME)
-        print(f"✅ Gemini model '{GEMINI_MODEL_NAME}' configured successfully.")
     except Exception as e:
-        print(f"⚠️ Failed to configure Gemini client: {e}")
+        client = None
+        model = None
+        st.error(f"⚠️ Failed to configure Gemini client: {e}")
 else:
-    print("⚠️ Skipping model configuration — API key missing.")
+    st.warning(
+        f"⚠️ Gemini API key not found. Add '{GEMINI_SECRET_NAME}' "
+        "to Streamlit Cloud → Manage app → Settings → Secrets."
+    )
 
 # ------------------------------------------------------------
 # STEP 4: Prompt construction functions
@@ -415,10 +423,6 @@ def roadmap_to_txt(data: dict, user_data: dict) -> str:
     md_text = roadmap_to_markdown(data, user_data)
     txt = re.sub(r"[#*_>\[\]()]", "", md_text)
     return txt
-
-import streamlit as st
-import json
-import os
 
 st.set_page_config(
     page_title="LearnPath AI",
