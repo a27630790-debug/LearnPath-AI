@@ -8,16 +8,16 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-GEMINI_MODEL_NAME = "gemini-3.6-flash"
+# Standard models with fallback
+PRIMARY_MODEL_NAME = "gemini-2.5-flash"
+FALLBACK_MODEL_NAME = "gemini-1.5-flash"
+
 SUPPORTED_LANGUAGES = ["English", "Urdu", "Roman Urdu"]
 MIN_DURATION_WEEKS, MAX_DURATION_WEEKS = 2, 52
 MIN_DAILY_MINUTES, MAX_DAILY_MINUTES = 30, 480
 
 # ------------------------------------------------------------
 # STEP 2: Load and clean secrets
-# ------------------------------------------------------------
-# Streamlit Cloud secret name: GEMINI_API_KEY
-# NEVER put the actual key value directly in this code.
 # ------------------------------------------------------------
 
 def clean_key(raw_key: str) -> str:
@@ -44,24 +44,18 @@ def load_gemini_key():
 
 API_KEY = load_gemini_key()
 
-if API_KEY:
-    print("Gemini API key loaded successfully.")
-else:
-    print(f"Gemini API key not found. Add '{GEMINI_SECRET_NAME}' in Streamlit Secrets.")
 # ------------------------------------------------------------
-# STEP 3: Configure the Gemini client + a wrapper for generate_content
+# STEP 3: Configure the Gemini client + wrapper
 # ------------------------------------------------------------
 
 client = None
-model = None
 
 
 class GeminiModelWrapper:
-    def __init__(self, client, model_name):
+    def __init__(self, client):
         self.client = client
-        self.model_name = model_name
 
-    def generate_content(self, contents, generation_config=None):
+    def generate_content(self, contents, model_name, generation_config=None):
         cfg = generation_config or {}
         config = types.GenerateContentConfig(
             temperature=cfg.get("temperature", 0.7),
@@ -70,19 +64,20 @@ class GeminiModelWrapper:
             response_mime_type=cfg.get("response_mime_type", "application/json"),
         )
         return self.client.models.generate_content(
-            model=self.model_name, contents=contents, config=config
+            model=model_name, contents=contents, config=config
         )
 
 
 if API_KEY:
     try:
         client = genai.Client(api_key=API_KEY)
-        model = GeminiModelWrapper(client, GEMINI_MODEL_NAME)
+        wrapper = GeminiModelWrapper(client)
     except Exception as e:
         client = None
-        model = None
+        wrapper = None
         st.error(f"⚠️ Failed to configure Gemini client: {e}")
 else:
+    wrapper = None
     st.warning(
         f"⚠️ Gemini API key not found. Add '{GEMINI_SECRET_NAME}' "
         "to Streamlit Cloud → Manage app → Settings → Secrets."
@@ -237,11 +232,8 @@ JSON structure as before. Write everything in {user_data['language']}.
 """
     return textwrap.dedent(prompt).strip()
 
-
-print("Prompt builder functions ready.")
-
 # ------------------------------------------------------------
-# STEP 5: Gemini API call function (with error handling)
+# STEP 5: Gemini API call function with 503 retry + fallback
 # ------------------------------------------------------------
 
 class GeminiCallError(Exception):
@@ -249,57 +241,54 @@ class GeminiCallError(Exception):
     pass
 
 
-def call_gemini(prompt: str, max_retries: int = 2):
-    """
-    Calls the Gemini API and returns the raw text response.
-    Raises GeminiCallError with a friendly message on failure.
-    """
-    if model is None:
+def call_gemini(prompt: str, max_retries: int = 3):
+    """Calls Gemini API with exponential backoff for 503/high demand and fallback model support."""
+    if wrapper is None:
         raise GeminiCallError(
             "Gemini model is not configured. Please check your Gemini API key in Streamlit Secrets."
         )
 
+    models_to_try = [PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME]
     last_error = None
-    for attempt in range(max_retries + 1):
-        try:
-            response = model.generate_content(prompt)
 
-            if not response or not getattr(response, "text", None):
-                raise GeminiCallError("Gemini returned an empty response. Please try again.")
+    for model_name in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                response = wrapper.generate_content(prompt, model_name=model_name)
 
-            return response.text
+                if not response or not getattr(response, "text", None):
+                    raise GeminiCallError("Gemini returned an empty response. Please try again.")
 
-        except Exception as e:
-            last_error = e
-            error_str = str(e).lower()
+                return response.text
 
-            if "api key" in error_str or "permission" in error_str or "unauthorized" in error_str:
-                raise GeminiCallError(
-                    "Invalid or unauthorized API key. Please check your Gemini API key in Streamlit Secrets."
-                )
-            if "quota" in error_str or "rate limit" in error_str or "429" in error_str:
-                if attempt < max_retries:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise GeminiCallError(
-                    "Gemini API rate limit or quota exceeded. Please wait a moment and try again."
-                )
-            if "timeout" in error_str or "network" in error_str or "connection" in error_str:
-                if attempt < max_retries:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise GeminiCallError(
-                    "Network/timeout error while contacting Gemini. Please check your connection and try again."
-                )
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
 
-            if attempt < max_retries:
-                time.sleep(1)
-                continue
+                # Auth / API Key Errors
+                if any(k in error_str for k in ["api key", "permission", "unauthorized"]):
+                    raise GeminiCallError(
+                        "Invalid or unauthorized API key. Please check your Gemini API key in Streamlit Secrets."
+                    )
 
-    raise GeminiCallError(f"Unexpected error while calling Gemini: {last_error}")
+                # 503 / High Demand / Rate limit / Server Overloaded -> Wait & Retry
+                if any(k in error_str for k in ["503", "unavailable", "demand", "overloaded", "quota", "rate limit", "429", "resource exhausted"]):
+                    if attempt < max_retries - 1:
+                        time.sleep(3 * (attempt + 1))  # Exponential backoff (3s, 6s)
+                        continue
 
+                # Network / Timeout -> Wait & Retry
+                if any(k in error_str for k in ["timeout", "network", "connection"]):
+                    if attempt < max_retries - 1:
+                        time.sleep(2 * (attempt + 1))
+                        continue
 
-print("Gemini API call function ready.")
+                # Break current model loop to try fallback model if available
+                break
+
+    raise GeminiCallError(
+        f"Gemini servers are currently experiencing high demand (503). Please wait 1 minute and try again. Detail: {last_error}"
+    )
 
 # ------------------------------------------------------------
 # STEP 6: Response validation and JSON parsing
@@ -348,10 +337,7 @@ def validate_roadmap(data: dict):
 
 
 def parse_gemini_roadmap(raw_text: str):
-    """
-    Full pipeline: extract JSON -> validate -> return (roadmap_dict, error_message).
-    On failure, roadmap_dict is None and error_message explains what went wrong.
-    """
+    """Full pipeline: extract JSON -> validate -> return (roadmap_dict, error_message)."""
     data = extract_json_from_text(raw_text)
     if data is None:
         return None, "Could not parse Gemini's response as valid JSON. Please try generating again."
@@ -363,12 +349,10 @@ def parse_gemini_roadmap(raw_text: str):
     return data, None
 
 
-print("Response validation/parsing functions ready.")
-
 def roadmap_to_markdown(data: dict, user_data: dict) -> str:
     """Converts the roadmap JSON into a well-structured Markdown document."""
     md = []
-    md.append(f"# LearnPath AI — Personalized Roadmap\n")
+    md.append("# LearnPath AI — Personalized Roadmap\n")
     md.append(f"**Goal:** {user_data['goal']}\n")
 
     ga = data.get("goal_analysis", {})
@@ -424,6 +408,10 @@ def roadmap_to_txt(data: dict, user_data: dict) -> str:
     txt = re.sub(r"[#*_>\[\]()]", "", md_text)
     return txt
 
+# ------------------------------------------------------------
+# STEP 7: Streamlit UI
+# ------------------------------------------------------------
+
 st.set_page_config(
     page_title="LearnPath AI",
     page_icon="🚀",
@@ -436,9 +424,7 @@ st.markdown(
 )
 
 st.markdown(
-    "<p style='text-align:center; color:gray;'>"
-    "Your Personalized AI Learning Roadmap"
-    "</p>",
+    "<p style='text-align:center; color:gray;'>Your Personalized AI Learning Roadmap</p>",
     unsafe_allow_html=True
 )
 
@@ -468,10 +454,7 @@ with st.container():
     goal = st.text_area(
         "Describe your career or learning goal",
         height=100,
-        placeholder=(
-            "e.g. I want to become an AI Engineer "
-            "and specialize in AI agents."
-        )
+        placeholder="e.g. I want to become an AI Engineer and specialize in AI agents."
     )
 
     st.subheader("🧠 Current Skills")
@@ -684,8 +667,8 @@ if st.session_state.roadmap:
     mentor = data.get("ai_mentor_advice", {})
     st.subheader("🤖 AI Mentor Advice")
     st.info(
-        f"**Focus First:** {mentor.get('focus_first', '')}\\n\\n"
-        f"**Next Action:** {mentor.get('next_action', '')}\\n\\n"
+        f"**Focus First:** {mentor.get('focus_first', '')}\n\n"
+        f"**Next Action:** {mentor.get('next_action', '')}\n\n"
         f"**Motivation:** {mentor.get('motivation', '')}"
     )
 
