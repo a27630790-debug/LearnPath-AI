@@ -8,9 +8,9 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# Standard models with fallback
+# Active and supported Gemini models
 PRIMARY_MODEL_NAME = "gemini-2.5-flash"
-FALLBACK_MODEL_NAME = "gemini-1.5-flash"
+FALLBACK_MODEL_NAME = "gemini-2.0-flash"
 
 SUPPORTED_LANGUAGES = ["English", "Urdu", "Roman Urdu"]
 MIN_DURATION_WEEKS, MAX_DURATION_WEEKS = 2, 52
@@ -233,7 +233,7 @@ JSON structure as before. Write everything in {user_data['language']}.
     return textwrap.dedent(prompt).strip()
 
 # ------------------------------------------------------------
-# STEP 5: Gemini API call function with 503 retry + fallback
+# STEP 5: Gemini API call function with retry + fallback
 # ------------------------------------------------------------
 
 class GeminiCallError(Exception):
@@ -241,8 +241,8 @@ class GeminiCallError(Exception):
     pass
 
 
-def call_gemini(prompt: str, max_retries: int = 3):
-    """Calls Gemini API with exponential backoff for 503/high demand and fallback model support."""
+def call_gemini(prompt: str, max_retries: int = 2):
+    """Calls Gemini API with automatic fallback for 404/503 errors."""
     if wrapper is None:
         raise GeminiCallError(
             "Gemini model is not configured. Please check your Gemini API key in Streamlit Secrets."
@@ -252,7 +252,7 @@ def call_gemini(prompt: str, max_retries: int = 3):
     last_error = None
 
     for model_name in models_to_try:
-        for attempt in range(max_retries):
+        for attempt in range(max_retries + 1):
             try:
                 response = wrapper.generate_content(prompt, model_name=model_name)
 
@@ -271,23 +271,26 @@ def call_gemini(prompt: str, max_retries: int = 3):
                         "Invalid or unauthorized API key. Please check your Gemini API key in Streamlit Secrets."
                     )
 
-                # 503 / High Demand / Rate limit / Server Overloaded -> Wait & Retry
-                if any(k in error_str for k in ["503", "unavailable", "demand", "overloaded", "quota", "rate limit", "429", "resource exhausted"]):
-                    if attempt < max_retries - 1:
-                        time.sleep(3 * (attempt + 1))  # Exponential backoff (3s, 6s)
-                        continue
+                # 404 Not Found -> Switch model immediately
+                if "404" in error_str or "not_found" in error_str:
+                    break
 
-                # Network / Timeout -> Wait & Retry
-                if any(k in error_str for k in ["timeout", "network", "connection"]):
-                    if attempt < max_retries - 1:
+                # 503 / High Demand / Rate limit -> Backoff and retry
+                if any(k in error_str for k in ["503", "unavailable", "demand", "overloaded", "quota", "rate limit", "429"]):
+                    if attempt < max_retries:
                         time.sleep(2 * (attempt + 1))
                         continue
 
-                # Break current model loop to try fallback model if available
+                # Network / Timeout -> Retry
+                if any(k in error_str for k in ["timeout", "network", "connection"]):
+                    if attempt < max_retries:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+
                 break
 
     raise GeminiCallError(
-        f"Gemini servers are currently experiencing high demand (503). Please wait 1 minute and try again. Detail: {last_error}"
+        f"Could not reach Gemini service. Details: {last_error}"
     )
 
 # ------------------------------------------------------------
