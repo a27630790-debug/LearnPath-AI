@@ -9,8 +9,8 @@ from google import genai
 from google.genai import types
 
 # Active and supported Gemini models
-PRIMARY_MODEL_NAME = "gemini-2.5-flash"
-FALLBACK_MODEL_NAME = "gemini-2.0-flash"
+PRIMARY_MODEL_NAME = "gemini-3.6-flash"
+FALLBACK_MODEL_NAME = "gemini-3.5-flash"
 
 SUPPORTED_LANGUAGES = ["English", "Urdu", "Roman Urdu"]
 MIN_DURATION_WEEKS, MAX_DURATION_WEEKS = 2, 52
